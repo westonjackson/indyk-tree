@@ -1,0 +1,24 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite both the software and the paper it implements."
+
+title: "indyk-tree: Static ℓ∞ Approximate Nearest Neighbor Data Structure"
+version: 0.1.0
+license: MIT
+repository-code: "https://github.com/westonjackson/indyk-tree"
+
+authors:
+  - family-names: Jackson
+    given-names: Weston
+
+references:
+  - type: article
+    authors:
+      - family-names: Indyk
+        given-names: Piotr
+    title: "On Approximate Nearest Neighbors under ℓ∞ Norm"
+    journal: "Journal of Computer and System Sciences"
+    volume: 63
+    issue: 4
+    year: 2001
+    pages: "627-638"
+    doi: "10.1006/jcss.2001.1781"
