@@ -1,13 +1,16 @@
 """InstrumentedIndykTree: IndykTree subclass with build and query statistics.
 
-Relies on Python's MRO: both _build and _query in IndykTree call ``self.*``,
-so overriding them in this subclass instruments the entire recursion without
-duplicating any logic.
+After the iterative refactor of IndykTree._build and _query, instrumentation
+is done via explicit hook methods (_on_build_entry, _on_sep_node_built, etc.)
+that IndykTree calls at each logical step.  InstrumentedIndykTree overrides
+those hooks to accumulate statistics, replacing the earlier MRO-intercept
+pattern which required recursive _build/_query calls and doubled stack depth.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Any
 
 import numpy as np
 import numpy.typing as npt
@@ -26,7 +29,7 @@ class BuildStats:
     total_nodes: int = 0
     separator_nodes: int = 0
     box_nodes: int = 0
-    total_memberships: int = 0  # Σ n_i across all _build(points_i) calls
+    total_memberships: int = 0  # Σ n_i across all non-empty build work items
     max_depth: int = 0
     build_time: float = 0.0
 
@@ -52,13 +55,19 @@ class InstrumentedIndykTree(IndykTree):
 
     Statistics are accumulated in ``build_stats`` during construction and
     reset/collected per call in ``last_query_stats`` during querying.
+
+    The base-class iterative build calls ``_on_build_entry``,
+    ``_on_sep_node_built``, and ``_on_box_node_built`` at each logical step;
+    the iterative query calls ``_on_sep_node_visited`` and
+    ``_on_box_node_visited``.  This subclass overrides all five hooks to
+    populate ``build_stats`` and ``last_query_stats`` without duplicating any
+    algorithm logic.
     """
 
     def __init__(self, rho: float) -> None:
         super().__init__(rho)
         self.build_stats = BuildStats()
         self.last_query_stats = QueryStats()
-        self._current_depth: int = 0
 
     # ------------------------------------------------------------------
     # Build instrumentation
@@ -67,40 +76,36 @@ class InstrumentedIndykTree(IndykTree):
     def build(self, points: FloatArray) -> None:
         """Build the tree and reset all build statistics."""
         self.build_stats = BuildStats()
-        self._current_depth = 0
         super().build(points)
         self.build_stats.max_depth = self._compute_tree_depth()
 
-    def _build(self, points: FloatArray) -> object:  # type: ignore[override]
-        n = len(points)
-        if n == 0:
-            return None
-
+    def _on_build_entry(self, n: int) -> None:
+        """Count memberships and total nodes for each non-empty build work item."""
         self.build_stats.total_memberships += n
         self.build_stats.total_nodes += 1
 
-        # Delegate to parent; recursive calls within IndykTree._build dispatch
-        # back to this override via Python's MRO (self._build is us).
-        node = super()._build(points)
+    def _on_sep_node_built(self, node: SeparatorNode) -> None:
+        """Tally separator nodes as they are created."""
+        self.build_stats.separator_nodes += 1
 
-        if isinstance(node, SeparatorNode):
-            self.build_stats.separator_nodes += 1
-        elif isinstance(node, BoxNode):
-            self.build_stats.box_nodes += 1
-
-        return node
+    def _on_box_node_built(self, node: BoxNode) -> None:
+        """Tally box nodes as they are created."""
+        self.build_stats.box_nodes += 1
 
     def _compute_tree_depth(self) -> int:
-        def walk(node: object, d: int) -> int:
+        """Compute tree depth iteratively to avoid hitting the recursion limit."""
+        stack: list[tuple[Any, int]] = [(self._root, 0)]
+        max_d = 0
+        while stack:
+            node, d = stack.pop()
             if node is None:
-                return d
-            if isinstance(node, SeparatorNode):
-                return max(walk(node.left, d + 1), walk(node.right, d + 1))
-            if isinstance(node, BoxNode):
-                return walk(node.continuation, d + 1)
-            return d
-
-        return walk(self._root, 0)
+                max_d = max(max_d, d)
+            elif isinstance(node, SeparatorNode):
+                stack.append((node.left, d + 1))
+                stack.append((node.right, d + 1))
+            elif isinstance(node, BoxNode):
+                stack.append((node.continuation, d + 1))
+        return max_d
 
     # ------------------------------------------------------------------
     # Query instrumentation
@@ -116,7 +121,6 @@ class InstrumentedIndykTree(IndykTree):
         qs = QueryStats()
         self.last_query_stats = qs
 
-        # Run tree traversal (our _query override counts nodes).
         result = self._query(y, self._root)
 
         if result is None:
@@ -127,20 +131,15 @@ class InstrumentedIndykTree(IndykTree):
 
         return result
 
-    def _query(self, y: FloatArray, node: object) -> FloatArray | None:
-        if node is None:
-            return None
+    def _on_sep_node_visited(self, node: SeparatorNode) -> None:
+        """Count separator-node visits during query."""
+        self.last_query_stats.nodes_visited += 1
+        self.last_query_stats.sep_visits += 1
 
-        qs = self.last_query_stats
-        if isinstance(node, SeparatorNode):
-            qs.nodes_visited += 1
-            qs.sep_visits += 1
-        elif isinstance(node, BoxNode):
-            qs.nodes_visited += 1
-            qs.box_visits += 1
-
-        # Dispatch to parent logic; recursive calls come back here via MRO.
-        return super()._query(y, node)  # type: ignore[return-value]
+    def _on_box_node_visited(self, node: BoxNode) -> None:
+        """Count box-node visits during query."""
+        self.last_query_stats.nodes_visited += 1
+        self.last_query_stats.box_visits += 1
 
 
 # ---------------------------------------------------------------------------

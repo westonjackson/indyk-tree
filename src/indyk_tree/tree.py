@@ -17,6 +17,7 @@ larger space and build time.  Typical values: ρ ∈ (0, 2].
 from __future__ import annotations
 
 import math
+from typing import Any
 
 import numpy as np
 import numpy.typing as npt
@@ -144,11 +145,14 @@ class IndykTree:
         return result
 
     # ------------------------------------------------------------------
-    # Internal construction
+    # Internal construction (iterative — no Python recursion)
     # ------------------------------------------------------------------
 
     def _build(self, points: FloatArray) -> Node:
-        r"""Recursively construct the tree on *points*.
+        r"""Construct the tree on *points* using an iterative work-stack.
+
+        Uses an explicit work/result stack instead of recursion to avoid
+        Python's default recursion limit (~1000 frames).
 
         Phase 1 — separator search (Section 3):
             Try every (coordinate, threshold) candidate.  If a good separator
@@ -174,90 +178,136 @@ class IndykTree:
             point set is empty.
 
         """
-        n = len(points)
-        if n == 0:
-            return None
-        if n == 1:
-            # Trivial box: the single point is its own representative.
-            return self._make_box_node(
-                points, np.array([], dtype=np.float64).reshape(0, self._d)
-            )
+        # Work stack: each item is a tuple whose first element is an opcode.
+        #   ("build", pts)           — compute a node for pts; push result
+        #   ("sep",   axis, t)       — pop right, pop left; push SeparatorNode
+        #   ("box",   ctr, rep, bps) — pop continuation; push BoxNode
+        work: list[Any] = [("build", points)]
+        result: list[Node] = []
 
-        sep = find_best_separator(points, self.rho)
+        while work:
+            item = work.pop()
+            op: str = item[0]
 
-        if sep is not None:
-            axis, t = sep.axis, sep.threshold
-            col = points[:, axis]
-            l_mask = col < t - 1.0
-            r_mask = col > t + 1.0
-            m_mask = ~l_mask & ~r_mask
+            if op == "build":
+                pts: FloatArray = item[1]
+                n = len(pts)
 
-            p1 = points[l_mask | m_mask]  # L ∪ M
-            p2 = points[r_mask | m_mask]  # R ∪ M
+                if n == 0:
+                    result.append(None)
+                    continue
 
-            return SeparatorNode(
-                axis=axis,
-                threshold=t,
-                left=self._build(p1),
-                right=self._build(p2),
-            )
+                self._on_build_entry(n)
 
-        # No good separator — form a box node.
-        return self._make_box_node_from_heuristic(points)
+                if n == 1:
+                    ctr = pts[0].copy()
+                    rep = pts[0].copy()
+                    node: Node = BoxNode(
+                        center=ctr,
+                        representative=rep,
+                        box_points=pts.copy(),
+                        continuation=None,
+                    )
+                    self._on_box_node_built(node)  # type: ignore[arg-type]
+                    result.append(node)
+                    continue
 
-    def _make_box_node(self, box_points: FloatArray, remainder: FloatArray) -> BoxNode:
-        """Create a BoxNode from an explicit box set and remainder."""
-        bb_min = box_points.min(axis=0)
-        bb_max = box_points.max(axis=0)
-        center = (bb_min + bb_max) / 2.0
-        representative = box_points[0].copy()
-        return BoxNode(
-            center=center,
-            representative=representative,
-            box_points=box_points.copy(),
-            continuation=self._build(remainder),
-        )
+                sep = find_best_separator(pts, self.rho)
 
-    def _make_box_node_from_heuristic(self, points: FloatArray) -> BoxNode:
-        r"""Form a box using the practical heuristic (see :meth:`_build`).
+                if sep is not None:
+                    axis, t = sep.axis, sep.threshold
+                    col = pts[:, axis]
+                    l_mask = col < t - 1.0
+                    r_mask = col > t + 1.0
+                    m_mask = ~l_mask & ~r_mask
 
-        Heuristic: find the ⌈n/2⌉ points closest to the coordinate-wise
-        median under ℓ∞, declare them the box C, and recurse on P \\ C.
+                    p1 = pts[l_mask | m_mask]   # L ∪ M  (routed left)
+                    p2 = pts[r_mask | m_mask]   # R ∪ M  (routed right)
 
-        This is a practical approximation of the existence argument in
-        Lemma 2 / Appendix A of Indyk (2001).  The full inductive
-        construction is not implemented; this is documented honestly in the
-        README and test file.
-        """
-        n = len(points)
-        median = np.median(points, axis=0)
-        dists = linf_distances_to_point(points, median)
-        box_size = math.ceil(n / 2)
-        idx = np.argpartition(dists, box_size - 1)
-        box_idx = idx[:box_size]
-        rest_idx = idx[box_size:]
+                    # Push make_sep first (executed last), then right then
+                    # left; stack is LIFO so left is processed first, giving
+                    # result order: [left, right] → popped as right then left.
+                    work.append(("sep", axis, t))
+                    work.append(("build", p2))
+                    work.append(("build", p1))
 
-        box_points = points[box_idx]
-        remainder = points[rest_idx]
+                else:
+                    # Box-node heuristic: ⌈n/2⌉ points closest to the median.
+                    median = np.median(pts, axis=0)
+                    dists = linf_distances_to_point(pts, median)
+                    box_size = math.ceil(n / 2)
+                    idx = np.argpartition(dists, box_size - 1)
+                    box_pts = pts[idx[:box_size]]
+                    remainder = pts[idx[box_size:]]
 
-        return self._make_box_node(box_points, remainder)
+                    bb_min = box_pts.min(axis=0)
+                    bb_max = box_pts.max(axis=0)
+                    ctr2 = (bb_min + bb_max) / 2.0
+                    rep2 = box_pts[0].copy()
+                    bps_copy = box_pts.copy()
+
+                    work.append(("box", ctr2, rep2, bps_copy))
+                    work.append(("build", remainder))
+
+            elif op == "sep":
+                _, axis, t = item
+                # Build order: left was pushed last → processed first → deeper
+                # in result stack.  Right was pushed second-to-last →
+                # processed second → on top of result stack.
+                right = result.pop()
+                left = result.pop()
+                sep_node = SeparatorNode(
+                    axis=int(axis), threshold=float(t), left=left, right=right
+                )
+                self._on_sep_node_built(sep_node)
+                result.append(sep_node)
+
+            else:  # "box"
+                _, ctr, rep, bps = item
+                continuation = result.pop()
+                box_node = BoxNode(
+                    center=ctr,
+                    representative=rep,
+                    box_points=bps,
+                    continuation=continuation,
+                )
+                self._on_box_node_built(box_node)
+                result.append(box_node)
+
+        return result[0]
 
     # ------------------------------------------------------------------
-    # Internal query
+    # Internal query (iterative — no Python recursion)
     # ------------------------------------------------------------------
 
     def _query(self, y: FloatArray, node: Node) -> FloatArray | None:
-        """Recursive query — see :meth:`query` for the pseudocode."""
-        if node is None:
-            return None
+        """Execute the query iteratively — see :meth:`query` for the pseudocode."""
+        while node is not None:
+            if isinstance(node, SeparatorNode):
+                self._on_sep_node_visited(node)
+                node = node.left if y[node.axis] < node.threshold else node.right
+            else:  # BoxNode
+                self._on_box_node_visited(node)  # type: ignore[arg-type]
+                if linf_distance(y, node.center) <= 1.0:
+                    return node.representative
+                node = node.continuation
+        return None
 
-        if isinstance(node, SeparatorNode):
-            if y[node.axis] < node.threshold:
-                return self._query(y, node.left)
-            else:
-                return self._query(y, node.right)
+    # ------------------------------------------------------------------
+    # Instrumentation hooks (no-ops in the base class)
+    # ------------------------------------------------------------------
 
-        # BoxNode
-        if linf_distance(y, node.center) <= 1.0:
-            return node.representative
-        return self._query(y, node.continuation)
+    def _on_build_entry(self, n: int) -> None:
+        """Override to observe each non-empty build work item."""
+
+    def _on_sep_node_built(self, node: SeparatorNode) -> None:
+        """Override to observe each SeparatorNode as it is created."""
+
+    def _on_box_node_built(self, node: BoxNode) -> None:
+        """Override to observe each BoxNode as it is created."""
+
+    def _on_sep_node_visited(self, node: SeparatorNode) -> None:
+        """Override to observe each SeparatorNode visited during query."""
+
+    def _on_box_node_visited(self, node: BoxNode) -> None:
+        """Override to observe each BoxNode visited during query."""
