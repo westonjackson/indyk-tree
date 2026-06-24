@@ -10,6 +10,7 @@ Options:
     --rho    FLOAT ...  Override rho values
     --dist   STR  ...   Override distribution names
     --seed   INT        Base random seed [default: 42]
+    --repeats INT       Independent seeds per config [default: 5]
     --no-plots          Skip generating plots (useful for quick smoke tests)
     --plots-only PATH   Only generate plots from an existing CSV at PATH
 """
@@ -20,7 +21,7 @@ import argparse
 import sys
 from pathlib import Path
 
-from .harness import D_VALUES, DIST_NAMES, N_VALUES, RHO_VALUES, run_grid
+from .harness import D_VALUES, DIST_NAMES, N_REPEATS, N_VALUES, RHO_VALUES, run_grid
 from .plots import generate_all_plots
 
 
@@ -34,6 +35,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--rho", nargs="+", type=float, default=None)
     p.add_argument("--dist", nargs="+", default=None)
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--repeats", type=int, default=N_REPEATS)
     p.add_argument("--no-plots", action="store_true")
     p.add_argument("--plots-only", metavar="CSV_PATH", default=None)
     return p.parse_args()
@@ -59,6 +61,7 @@ def main() -> None:
         rho_values=args.rho or RHO_VALUES,
         dist_names=args.dist or DIST_NAMES,
         base_seed=args.seed,
+        n_repeats=args.repeats,
     )
 
     if not args.no_plots:

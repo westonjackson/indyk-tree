@@ -1,11 +1,13 @@
-"""Generate the four benchmark plots from benchmark_raw.csv.
+"""Generate benchmark plots from benchmark_raw.csv.
 
 Plot outputs are written to results/ as PNG files:
-  (a) space_vs_n.png          — total_memberships vs n (log-log), one line per rho,
-                                 with n^{1+rho} reference overlaid
-  (b) approx_ratio_vs_d.png   — mean approx ratio vs d, one line per distribution
-  (c) box_visit_frac.png      — mean box-visit fraction per distribution (bar chart)
-  (d) query_time_vs_d_logn.png — mean query time vs d·log(n), one line per rho
+  (a) space_vs_n.png              — total_memberships vs n (log-log), one line per rho,
+                                     with n^{1+rho} reference overlaid
+  (b) approx_ratio_vs_d.png       — mean approx ratio vs d, one line per distribution
+  (c) box_visit_frac.png          — mean box-visit fraction per distribution (bar chart)
+  (d) query_time_vs_d_logn.png    — mean query time vs d·log(n), one line per rho
+  (e) clustered_scatter.png       — scatter: approx_ratio (y, log) vs true_dist (x, log)
+                                     for clustered distribution only
 """
 
 from __future__ import annotations
@@ -43,14 +45,17 @@ def _savefig(fig: plt.Figure, path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Helper: aggregate build-level rows (one per n/d/rho/distribution/seed)
+# Helper: aggregate build-level rows (one per config × repeat)
 # ---------------------------------------------------------------------------
 
 
 def _build_level(df: pd.DataFrame) -> pd.DataFrame:
     """Deduplicate to one row per configuration (drop per-query variation)."""
+    group_keys = ["n", "d", "rho", "distribution", "seed"]
+    if "repeat" in df.columns:
+        group_keys.append("repeat")
     return (
-        df.groupby(["n", "d", "rho", "distribution", "seed"], as_index=False)
+        df.groupby(group_keys, as_index=False)
         .agg(
             total_memberships=("total_memberships", "first"),
             total_nodes=("total_nodes", "first"),
@@ -73,7 +78,6 @@ def plot_space_vs_n(df: pd.DataFrame, results_dir: Path) -> None:
     Averaged over all distributions and d values to show the main trend.
     """
     bdf = _build_level(df)
-    # Mean over all dist/d for each (n, rho).
     agg = (
         bdf.groupby(["n", "rho"], as_index=False)
         .agg(mean_mem=("total_memberships", "mean"))
@@ -88,7 +92,6 @@ def plot_space_vs_n(df: pd.DataFrame, results_dir: Path) -> None:
         mems = sub["mean_mem"].values
         m = RHO_MARKERS.get(rho, "o")
         (line,) = ax.loglog(ns, mems, marker=m, label=f"ρ={rho}", linewidth=2)
-        # Reference curve: n^{1+rho}, scaled to first data point.
         ref = ns[0] ** (1 + rho)
         scale = mems[0] / ref
         ax.loglog(
@@ -114,7 +117,6 @@ def plot_space_vs_n(df: pd.DataFrame, results_dir: Path) -> None:
 
 def plot_approx_ratio_vs_d(df: pd.DataFrame, results_dir: Path) -> None:
     """Mean approximation ratio vs dimension, one line per distribution."""
-    # Filter out inf ratios (happen when true_dist=0 and approx_dist>0).
     clean = df[df["approx_ratio"] != float("inf")].copy()
 
     agg = (
@@ -192,7 +194,7 @@ def plot_query_time_vs_d_logn(df: pd.DataFrame, results_dir: Path) -> None:
         m = RHO_MARKERS.get(rho, "o")
         ax.plot(
             sub["d_logn"],
-            sub["mean_qt"] * 1e3,  # convert to ms
+            sub["mean_qt"] * 1e3,
             marker=m,
             label=f"ρ={rho}",
             linewidth=2,
@@ -206,14 +208,65 @@ def plot_query_time_vs_d_logn(df: pd.DataFrame, results_dir: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Plot (e): clustered scatter — approx_ratio vs true_dist
+# ---------------------------------------------------------------------------
+
+
+def plot_clustered_scatter(df: pd.DataFrame, results_dir: Path) -> None:
+    """Scatter of approx_ratio (y, log) vs true_dist (x, log) for clustered data.
+
+    Restricted to rows where distribution='clustered', failure_reason='ok',
+    and true_dist > 1e-12 (to avoid log-of-zero).  Points are coloured by rho.
+    """
+    sub = df[
+        (df["distribution"] == "clustered")
+        & (df["failure_reason"] == "ok")
+        & (df["approx_ratio"] != float("inf"))
+        & (df["true_dist"] > 1e-12)
+    ].copy()
+
+    if sub.empty:
+        print("  (no clustered rows — skipping clustered_scatter.png)")
+        return
+
+    rhos = sorted(sub["rho"].unique())
+    rho_colors = {0.3: "#1f77b4", 0.6: "#ff7f0e", 1.0: "#d62728"}
+    fig, ax = plt.subplots(figsize=(7, 5))
+
+    for rho in rhos:
+        s = sub[sub["rho"] == rho]
+        ax.scatter(
+            s["true_dist"],
+            s["approx_ratio"],
+            alpha=0.25,
+            s=8,
+            color=rho_colors.get(rho, "#888888"),
+            label=f"ρ={rho}",
+            rasterized=True,
+        )
+
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+    ax.axhline(1.0, color="black", linestyle=":", linewidth=1, label="exact (=1)")
+    ax.set_xlabel("True ℓ∞ distance to nearest neighbor (log)")
+    ax.set_ylabel("Approximation ratio (log)")
+    ax.set_title("Clustered distribution: approx_ratio vs true_dist")
+    ax.legend(fontsize=8)
+    _savefig(fig, results_dir / "clustered_scatter.png")
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
 
 def generate_all_plots(csv_path: Path, results_dir: Path) -> None:
-    """Load CSV and generate all four plots."""
-    df = pd.read_csv(csv_path)
-    print(f"Loaded {len(df):,} rows from {csv_path}")
+    """Load CSV and generate all five plots (ok rows only)."""
+    df_raw = pd.read_csv(csv_path)
+    print(f"Loaded {len(df_raw):,} rows from {csv_path}")
+
+    df = df_raw[df_raw["failure_reason"] == "ok"].copy()
+    print(f"  → {len(df):,} rows with failure_reason='ok' used for plots")
 
     results_dir.mkdir(parents=True, exist_ok=True)
 
@@ -221,5 +274,6 @@ def generate_all_plots(csv_path: Path, results_dir: Path) -> None:
     plot_approx_ratio_vs_d(df, results_dir)
     plot_box_visit_frac(df, results_dir)
     plot_query_time_vs_d_logn(df, results_dir)
+    plot_clustered_scatter(df_raw, results_dir)
 
     print("All plots generated.")

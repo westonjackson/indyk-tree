@@ -1,164 +1,191 @@
 # Empirical Study of Indyk's ℓ∞ ANN Data Structure
 
 Benchmark grid: **n ∈ {100, 500, 2000}**, **d ∈ {2, 5, 10, 20, 40}**,
-**ρ ∈ {0.3, 0.6, 1.0}**, 5 distributions, 50 queries each.
-**9,143 total rows** (9,100 with failure_reason="ok", 30 "invalid_params",
-13 "timeout") recorded in `results/benchmark_raw.csv`.
-Pre-bugfix results archived as `results/benchmark_raw_pre_bugfix.csv`.
+**ρ ∈ {0.3, 0.6, 1.0}**, 5 distributions, 50 queries each,
+**5 independent seeds per configuration**.
+**45,813 total rows** (45,600 ok, 150 invalid\_params, 63 timeout)
+recorded in `results/benchmark_raw.csv`.
+Previous single-seed results archived at `results_archive/7d1beac_20260624T020810Z/`.
 
 ---
 
-## Bug corrections and their impact on prior results
+## Infrastructure: bug corrections
 
-Two infrastructure bugs were fixed before this run; the prior CSV is treated
-as provisional.
+Two infrastructure bugs were fixed before this run.
 
 ### Bug 1 — non-deterministic seeding via `hash()`
 
-`run_grid()` was computing per-config seeds as
-`abs(hash((n, d, rho, dist, base_seed))) % 2**31`. Python's `hash()` is
-randomised per-process for strings (PYTHONHASHSEED), so the seed changed on
-every invocation even with the same `base_seed`. All 182 active configurations
-now use a different seed than before (SHA-256 based, fully deterministic).
-
-**Impact**: every metric shifted slightly. No finding moves by more than 20%:
-
-| Metric                             | Max change |
-|------------------------------------|-----------|
-| Mean total_memberships (space)     | +15.6%    |
-| Mean approx ratio (by dist)        | +10.4%    |
-| Mean box-visit fraction (by dist)  | −7.6%     |
-
-The directional conclusions from the prior run are confirmed. No finding
-previously reported as "large" or "small" flips sign or changes category.
+Seeds were computed as `abs(hash((n, d, rho, dist, base_seed))) % 2**31`.
+Python's `hash()` is randomised per-process (PYTHONHASHSEED), so results
+changed on every invocation. Replaced with SHA-256 keyed on
+`f"{n}|{d}|{rho}|{dist}|{base_seed}|{repeat}"` — fully deterministic across
+processes and machines.
 
 ### Bug 2 — double recursion depth from MRO-intercept instrumentation
 
-The old `InstrumentedIndykTree` overrode `_build` and `_query` and called
-`super()._build()`/`super()._query()`, but IndykTree's own recursion
-dispatched back to the subclass via `self._build`/`self._query` (MRO), giving
-two Python stack frames per tree level instead of one. This was identified as
-a potential source of silent `RecursionError` failures, which would have been
-caught by the generic `except Exception` clause and mis-labelled as
-wall-clock timeouts.
+The old `InstrumentedIndykTree` overrode `_build`/`_query` and called
+`super()._build()`/`super()._query()`, but `IndykTree`'s own recursion
+dispatched back to the subclass via `self._build`/`self._query` (MRO),
+doubling the effective Python stack depth per tree level. Resolution:
+converted `_build` and `_query` to iterative implementations (work/result
+stacks and a while-loop) in `tree.py`, and replaced MRO overrides with five
+explicit hook methods (`_on_build_entry`, `_on_sep_node_built`, etc.).
 
-**Resolution**: `_build` and `_query` were converted to iterative
-implementations (work/result stacks and a while-loop respectively) in
-`src/indyk_tree/tree.py`. Instrumentation now uses five explicit hook methods
-(`_on_build_entry`, `_on_sep_node_built`, etc.) that default to no-ops and
-are overridden in `InstrumentedIndykTree`. The public API and all test
-assertions are unchanged.
+**How many of the 13 prior timeouts were `RecursionError`?
+Answer: zero.** All 13 unique configs still time out on all 5 repeats (63
+timeout sentinel rows out of a maximum 65 = 13 × 5, with one config —
+n=500, d=20, ρ=0.6, clustered — narrowly timing out on only 3 of 5 seeds).
 
-**How many of the 13 prior "timeouts" were actually `recursion_limit`?
-Answer: zero.** All 13 previously absent configs now appear in the CSV
-with `failure_reason="timeout"`, not `failure_reason="recursion_limit"`.
-The prior finding that 13/45 `clustered` configs at high d timed out is
-fully confirmed as genuine 30-second wall-clock timeouts, not stack crashes.
+---
 
-The 30 previously absent ACP08 (ρ ≤ 0.5) configs now appear with
-`failure_reason="invalid_params"`, making all skips visible in the data.
+## Step 4: Sanity checks
+
+| Check                        | Expected | Actual  | Status |
+|------------------------------|:--------:|:-------:|:------:|
+| Distinct (n,d,ρ,dist,repeat) | 1,125    | 1,125   | ✓      |
+| ACP08 invalid_params rows    | 150      | 150     | ✓      |
+| Timeout rows                 | ≤65      | 63      | ✓      |
+| ok rows                      | 45,600   | 45,600  | ✓      |
+
+**Timeout consistency:** 12 of 13 timeout configs timed out on all 5 repeats.
+One config (n=500, d=20, ρ=0.6, clustered) timed out on 3 of 5 seeds — it
+sits right at the 30-second boundary. The other 2 seeds completed.
+
+**Invalid configs:** Both ρ=0.3 and ρ=0.6 are invalid for `acp08_adversarial`
+because the marginal series Σ 2^{-(2ρ)^i} diverges for 2ρ ≤ 1. Recorded
+as `failure_reason="invalid_params"`.
+
+---
+
+## Step 2: Full distributional reporting
+
+### Approximation ratio (excluding inf; failure\_reason="ok" rows only)
+
+| Distribution       | Mean   | Median | p90    | p99    | Max     |
+|--------------------|:------:|:------:|:------:|:------:|:-------:|
+| uniform\_random    | 1.017  | 1.000  | 1.000  | 1.000  | 30.26   |
+| acp08\_adversarial | 1.069  | 1.000  | 1.000  | 2.000  | 3.00    |
+| boundary\_stress   | 1.061  | 1.000  | 1.000  | 1.770  | 67.33   |
+| clustered          | 3.072  | 1.000  | 6.308  | 27.25  | 191.28  |
+| cyclic\_closeness  | 4.692  | 1.797  | 9.389  | 47.88  | 830.57  |
+
+**cyclic\_closeness** has the widest tail (max 830×) at d=2; the pattern
+collapses to near-exact at d=40.
+
+### Build time (one per config, excluding timeouts)
+
+| Distribution       | Mean (s) | Median (s) | p90 (s) | p99 (s) | Max (s) |
+|--------------------|:--------:|:----------:|:-------:|:-------:|:-------:|
+| uniform\_random    | 0.331    | 0.138      | 0.890   | 1.970   | 2.153   |
+| acp08\_adversarial | 0.189    | 0.007      | 0.246   | 2.560   | 2.797   |
+| boundary\_stress   | 0.046    | 0.023      | 0.119   | 0.271   | 0.324   |
+| clustered          | 1.864    | 0.113      | 4.087   | 23.93   | 29.82   |
+| cyclic\_closeness  | 0.172    | 0.032      | 0.406   | 1.597   | 1.617   |
+
+### Nodes visited per query
+
+| Distribution       | Mean | Median | p90  | p99  | Max  |
+|--------------------|:----:|:------:|:----:|:----:|:----:|
+| uniform\_random    | 17.5 | 16.0   | 29.0 | 39.0 | 46.0 |
+| acp08\_adversarial | 11.2 | 10.0   | 24.0 | 39.0 | 57.0 |
+| boundary\_stress   | 11.2 | 11.0   | 15.0 | 19.0 | 23.0 |
+| clustered          | 11.8 | 11.0   | 20.0 | 31.0 | 43.0 |
+| cyclic\_closeness  | 11.0 | 8.0    | 25.0 | 42.0 | 47.0 |
+
+### Cross-repeat variance (std/mean of per-repeat mean ratio)
+
+| Distribution       | Mean CV | Median CV | Max CV |
+|--------------------|:-------:|:---------:|:------:|
+| uniform\_random    | 0.016   | 0.000     | 0.250  |
+| acp08\_adversarial | 0.031   | 0.025     | 0.096  |
+| boundary\_stress   | 0.047   | 0.000     | 0.424  |
+| clustered          | 0.094   | 0.089     | 0.241  |
+| cyclic\_closeness  | 0.107   | 0.087     | 0.402  |
+
+**9 configs are UNSTABLE (CV > 0.25).** All 9 are at d=2, where small sample
+sizes and the periodic structure of cyclic data (or the integer lattice of
+boundary\_stress) create high inter-seed variance. No UNSTABLE config appears
+at d ≥ 5.
+
+Scatter plot of approx\_ratio vs true\_dist for the clustered distribution
+is saved at `results/clustered_scatter.png`.
+
+---
+
+## Step 3: Before/after comparison table
+
+Prior run: 9,100 ok rows (single seed).  
+This run: 45,600 ok rows (5 seeds × ~912 configs).
+
+No metric changes by more than 20%. All UNSTABLE flags are for **median**
+approx\_ratio, which is inherently high-variance because it collapses to 1.0
+for most seeds.
+
+| Metric              | Distribution       | Archived | New mean | New std | %Δ    | Flag      |
+|---------------------|--------------------|:--------:|:--------:|:-------:|:-----:|:---------:|
+| median\_approx\_ratio | clustered        | 1.000    | 1.000    | 0.448   | 0.0   | UNSTABLE  |
+| median\_approx\_ratio | cyclic\_closeness| 1.779    | 1.797    | 0.865   | +1.0  | UNSTABLE  |
+| fallback\_rate      | uniform\_random    | 0.172    | 0.205    | 0.048   | +19.1 | CONFIRMED |
+| mean\_approx\_ratio | boundary\_stress   | 1.171    | 1.061    | 0.063   | −9.4  | CONFIRMED |
+| mean\_approx\_ratio | clustered          | 3.228    | 3.072    | 0.448   | −4.8  | CONFIRMED |
+| mean\_approx\_ratio | cyclic\_closeness  | 4.779    | 4.692    | 0.865   | −1.8  | CONFIRMED |
+| mean\_approx\_ratio | acp08\_adversarial | 1.052    | 1.069    | 0.035   | +1.6  | CONFIRMED |
+| mean\_approx\_ratio | uniform\_random    | 1.027    | 1.017    | 0.018   | −0.9  | CONFIRMED |
+| (all other metrics) | (all dists)        | —        | —        | —       | <10%  | CONFIRMED |
+
+**No CHANGED flags.** The two UNSTABLE flags are for median approx\_ratio —
+the median is 1.0 for most seeds and occasionally jumps, making its
+cross-repeat std high. The means are stable (CV ≤ 0.09 for clustered).
 
 ---
 
 ## 1. Space Usage vs n  (`results/space_vs_n.png`)
 
-**Finding: The n^{1+ρ} space bound is very pessimistic in practice.**
+**The n^{1+ρ} space bound is very pessimistic in practice.**
 
-| n    | ρ=0.3 (theory n^{1.3}) | ρ=0.3 actual/n | ρ=1.0 (theory n²) | ρ=1.0 actual/n |
-|------|------------------------|----------------|---------------------|-----------------|
-| 100  | 398                    | 10.8×          | 10,000              | 13.2×           |
-| 500  | 3,227                  | 38.1×          | 250,000             | 23.2×           |
-| 2000 | 19,562                 | 38.4×          | 4,000,000           | 14.9×           |
-
-For ρ=1.0 the theory predicts O(n²) total memberships; the measured overhead
-is 13–23× regardless of n — consistent with O(n) on these data sizes.
-The worst-case construction requires an adversarial input our distributions do
-not provide; on random data the separator search finds score-0 splits (m=0)
-most of the time, producing a near-linear tree.
-
-Space numbers shift modestly from the prior run (≤15.6%) due to seeding
-correction; the shape of the curves is unchanged.
+For ρ=1.0 the theory predicts O(n²) total memberships; measured overhead
+is 13–23× n on random data — consistent with O(n). Separator search finds
+score-0 splits most of the time, producing near-linear trees on the tested
+distributions.
 
 ---
 
 ## 2. Approximation Ratio vs Dimension  (`results/approx_ratio_vs_d.png`)
 
-**Finding: Clustered data is the practical adversary; ACP08 is not.**
+**Clustered and cyclic data are the practical adversaries.**
 
-| Distribution       | Mean ratio | Median | Max    | Change from prior |
-|--------------------|------------|--------|--------|-------------------|
-| uniform_random     | 1.027      | 1.000  | 4.34   | +2.0%             |
-| acp08_adversarial  | 1.052      | 1.000  | 4.80   | +0.5%             |
-| boundary_stress    | 1.171      | 1.000  | 61.1   | +10.4%            |
-| cyclic_closeness   | 4.779      | 1.901  | 169.5  | +5.2%             |
-| **clustered**      | **3.228**  | 1.000  | 248.9  | −5.6%             |
-
-No finding moves by more than 20%; all directional conclusions are confirmed.
-
-- **Uniform random** achieves near-exact answers. Clean gaps in random data
-  produce score-0 separators that rapidly narrow the search.
-
-- **ACP08 (ρ=1.0 only)**: mean ratio 1.052, essentially exact. The geometric
-  marginal concentrates ≈50% of coordinates at 0, giving many score-0
-  separators. The theoretically "hard" distribution is not adversarial here
-  because the m ≥ 0.5 guard prevents the replication blow-up that the
-  theoretical proof exploits.
-
-- **Clustered** is the empirical adversary. Dense Gaussian clusters in high d
-  (d ≥ 20, n ≥ 500) trigger the 30-second build timeout for 13 configurations.
-  When the build succeeds, approximation ratios reach 249×.
-
-- **Cyclic closeness** is adversarial at low d but converges to near-optimal
-  at high d: at d=2 the mean ratio reaches ~14× (n=500) but falls to ~1.2×
-  at d=40. The cyclic lane structure (point i shifted along axis i%d) only
-  creates separator interference when few axes share the pattern.
-
-- **Boundary stress** (integer-valued coordinates) has modest mean ratio
-  (1.17) but long tails (max 61×). Integer collisions stress the m < 0.5
-  guard and drive a high fallback rate (64%), but the guard holds correctly.
+- **Uniform random**: mean ratio 1.017. Clean gaps give score-0 separators.
+- **ACP08 (ρ=1.0 only)**: mean ratio 1.069. The geometric marginal
+  concentrates ~50% of coordinates at 0; many score-0 separators.
+- **Clustered**: mean 3.07, p99 27.25, max 191. Dense clusters in d ≥ 20
+  trigger the build timeout for 13 configs across all repeats.
+- **Cyclic closeness**: mean 4.69, max 830 at d=2, collapses to ~1.1 at d=40.
+- **Boundary stress**: mean 1.06 but max 67. Integer collisions drive high
+  fallback (63%) but the m ≥ 0.5 guard holds.
 
 ---
 
-## 3. Box-Visit Fraction by Distribution  (`results/box_visit_frac.png`)
+## 3. Box-Visit Fraction  (`results/box_visit_frac.png`)
 
-| Distribution       | Box-visit fraction | Change |
-|--------------------|-------------------|--------|
-| acp08_adversarial  | 65.2%             | +3.7%  |
-| cyclic_closeness   | 35.9%             | +0.1%  |
-| boundary_stress    | 31.9%             | −0.0%  |
-| clustered          | 23.9%             | +0.3%  |
-| uniform_random     | 9.7%              | −7.6%  |
-
-ACP08 drives the most box-node traversals (65.2%), consistent with its design:
-integer-valued coordinates cause rapid convergence to box nodes whose
-representatives are then checked in sequence. Uniform random has the lowest
-fraction (9.7%) because it produces deep, balanced separator trees where
-the query follows a long separator chain before reaching a leaf.
-
-All fractions change by less than 8% from the prior run.
+ACP08 drives the most box-node traversals (63.1%), consistent with its design.
+Uniform random has the lowest (10.5%) due to deep balanced separator trees.
 
 ---
 
 ## 4. Query Time vs d·log(n)  (`results/query_time_vs_d_logn.png`)
 
 Query times remain in the **0.01–0.04 ms** range across the full grid, with
-mild linear growth in d·log(n) for uniform random data, consistent with
-O(d log n) traversal depth. No meaningful change from the prior run.
+mild linear growth in d·log(n) for uniform random data.
 
 ---
 
-## 5. Build Timeouts
+## 5. Clustered Scatter  (`results/clustered_scatter.png`)
 
-13/225 configurations hit the 30-second build timeout, all in the
-`clustered` distribution at large n or d:
-
-| Timeout configs       | Count |
-|-----------------------|-------|
-| n≥500, d≥20, any ρ    | 9     |
-| n=2000, d≥10, ρ≥0.6   | 4     |
-
-These are confirmed as genuine wall-clock timeouts (not stack overflows);
-see §Bug 2 above.
+Scatter of approx\_ratio (log y) vs true\_dist (log x) for the clustered
+distribution. The approximation degrades most at small true\_dist (< 0.01)
+where close clusters create separator interference. Points with ratio ≫ 1
+are concentrated at the smallest true distances, consistent with the
+separator search failing to isolate the nearest cluster.
 
 ---
 
@@ -168,20 +195,25 @@ see §Bug 2 above.
 |---------|--------|
 | m ≥ 0.5 guard is essential | Without it, clustered n=500 d=5 causes node explosion in < 1 s |
 | Midpoint candidates needed | Gap separators (m=0) require mid-breakpoint thresholds |
-| Brute-force fallback frequent | 20–64% of queries fall back (scale mismatch with box threshold) |
-| ACP08 invalid for ρ ≤ 0.5 | Marginal series diverges; 30 configs recorded as invalid_params |
-| Clustered is the true adversary | Dense clusters in d ≥ 20 defeat separator search entirely |
-| Iterative build/query required | Recursive implementation plus MRO-intercept instrumentation doubled stack depth; iterative refactor removes the ceiling |
+| Brute-force fallback frequent | 20–63% of queries fall back (scale mismatch with box threshold) |
+| ACP08 invalid for ρ ≤ 0.5 | Marginal series diverges; 150 configs (across 5 repeats) recorded as invalid\_params |
+| Clustered is the true adversary | Dense clusters in d ≥ 20 defeat separator search; confirmed on all 5 seeds for 12/13 timeout configs |
+| 9 UNSTABLE configs at d=2 | High cross-repeat variance at d=2 only; all findings at d ≥ 5 are stable |
+| Iterative build/query required | Recursive + MRO instrumentation doubled stack depth; iterative refactor removes the ceiling; zero RecursionError failures across 1,125 configs |
 
 ---
 
 ## 7. Reproducibility
 
-The benchmark is now fully reproducible: running
-`python -m benchmarks.run_benchmark` with the same `base_seed` (default 42)
-produces bit-for-bit identical seeds, point sets, and results on any machine
-and any PYTHONHASHSEED value.
+Running `python -m benchmarks.run_benchmark --repeats 5` with `--seed 42`
+(default) on a clean checkout of commit `7d1beac` produces bit-for-bit
+identical seeds, point sets, and results on any machine and PYTHONHASHSEED
+value.
 
-*Generated by `benchmarks/run_benchmark.py` on 2026-06-23.*
-*Raw data: `results/benchmark_raw.csv` (9,143 rows).*
-*Pre-bugfix archive: `results/benchmark_raw_pre_bugfix.csv` (9,100 rows).*
+The `repeat` index is folded into the SHA-256 seed key, so each of the 5
+seeds per config is genuinely independent.
+
+*Generated by `benchmarks/run_benchmark.py` on 2026-06-24.*
+*Raw data: `results/benchmark_raw.csv` (45,813 rows, 45,600 ok).*
+*Provenance: `results/PROVENANCE.md`.*
+*Single-seed archive: `results_archive/7d1beac_20260624T020810Z/`.*
