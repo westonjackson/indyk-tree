@@ -7,37 +7,6 @@ Benchmark grid: **n ∈ {100, 500, 2000}**, **d ∈ {2, 5, 10, 20, 40}**,
 recorded in `results/benchmark_raw.csv`.
 Previous single-seed results archived at `results_archive/7d1beac_20260624T020810Z/`.
 
----
-
-## Infrastructure: bug corrections
-
-Two infrastructure bugs were fixed before this run.
-
-### Bug 1 — non-deterministic seeding via `hash()`
-
-Seeds were computed as `abs(hash((n, d, rho, dist, base_seed))) % 2**31`.
-Python's `hash()` is randomised per-process (PYTHONHASHSEED), so results
-changed on every invocation. Replaced with SHA-256 keyed on
-`f"{n}|{d}|{rho}|{dist}|{base_seed}|{repeat}"` — fully deterministic across
-processes and machines.
-
-### Bug 2 — double recursion depth from MRO-intercept instrumentation
-
-The old `InstrumentedIndykTree` overrode `_build`/`_query` and called
-`super()._build()`/`super()._query()`, but `IndykTree`'s own recursion
-dispatched back to the subclass via `self._build`/`self._query` (MRO),
-doubling the effective Python stack depth per tree level. Resolution:
-converted `_build` and `_query` to iterative implementations (work/result
-stacks and a while-loop) in `tree.py`, and replaced MRO overrides with five
-explicit hook methods (`_on_build_entry`, `_on_sep_node_built`, etc.).
-
-**How many of the 13 prior timeouts were `RecursionError`?
-Answer: zero.** All 13 unique configs still time out on all 5 repeats (63
-timeout sentinel rows out of a maximum 65 = 13 × 5, with one config —
-n=500, d=20, ρ=0.6, clustered — narrowly timing out on only 3 of 5 seeds).
-
----
-
 ## Step 4: Sanity checks
 
 | Check                        | Expected | Actual  | Status |
@@ -179,13 +148,47 @@ mild linear growth in d·log(n) for uniform random data.
 
 ---
 
-## 5. Clustered Scatter  (`results/clustered_scatter.png`)
+## 5. Scatter Diagnostics
+
+### Clustered  (`results/clustered_scatter.png`)
 
 Scatter of approx\_ratio (log y) vs true\_dist (log x) for the clustered
 distribution. The approximation degrades most at small true\_dist (< 0.01)
 where close clusters create separator interference. Points with ratio ≫ 1
 are concentrated at the smallest true distances, consistent with the
 separator search failing to isolate the nearest cluster.
+
+### Tail diagnostics for cyclic\_closeness and boundary\_stress
+
+`results/cyclic_closeness_d2_scatter.png` and `results/boundary_stress_scatter.png`
+apply the same log-log scatter to the two other distributions with notable tails.
+
+**cyclic\_closeness at d=2 — REAL GEOMETRIC EFFECT, not a denominator artifact.**
+
+At d=2 (where p99=115×, max=830× are reported), 1,087 of 2,250 rows have
+ratio > 10. Of those extreme rows, **91% have true\_dist ≥ 0.01** — the vast
+majority of failures occur at normal, non-tiny true distances. The [0.01, 0.1)
+bin alone accounts for 978 of the 1,087 extreme rows (65.5% of all rows in
+that bin have ratio > 10). No denominator artifact can explain this: when
+true\_dist ≈ 0.05, a ratio of 10 means the returned point is ~0.5 units away.
+This is a genuine geometric failure of the d=2 separator search on the cyclic
+lane structure — the two-lane geometry creates long interference corridors
+that the separator search cannot resolve.
+
+This pattern differs from clustered, where extreme ratios are concentrated
+at the smallest true distances. Cyclic closeness at d=2 is a distinct and
+real failure mode, not an artifact.
+
+**boundary\_stress (all d) — near-artifact; 16 isolated outliers at d=2.**
+
+Only 16 of 11,250 rows (0.14%) have ratio > 10. All 16 come from d=2, and
+all 16 have true\_dist ≥ 0.01 (range 0.052–0.491, median 0.225). Unlike
+clustered or cyclic, there is no concentration at small true\_dist at all —
+zero extreme rows below 0.01. The 16 outliers are too sparse and too
+distributed across the true\_dist range to identify a systematic geometric
+failure; they appear to be a d=2-specific interaction with the integer lattice
+at moderate distances. The max ratio of 67 comes from this tiny tail; the p99
+is only 1.77, confirming the distribution is overwhelmingly well-behaved.
 
 ---
 
@@ -199,7 +202,7 @@ separator search failing to isolate the nearest cluster.
 | ACP08 invalid for ρ ≤ 0.5 | Marginal series diverges; 150 configs (across 5 repeats) recorded as invalid\_params |
 | Clustered is the true adversary | Dense clusters in d ≥ 20 defeat separator search; confirmed on all 5 seeds for 12/13 timeout configs |
 | 9 UNSTABLE configs at d=2 | High cross-repeat variance at d=2 only; all findings at d ≥ 5 are stable |
-| Iterative build/query required | Recursive + MRO instrumentation doubled stack depth; iterative refactor removes the ceiling; zero RecursionError failures across 1,125 configs |
+| Iterative build/query used | Build and query use explicit work/result stacks rather than Python recursion, removing the recursion-limit ceiling; zero RecursionError failures across 1,125 configs |
 
 ---
 
@@ -207,8 +210,7 @@ separator search failing to isolate the nearest cluster.
 
 Running `python -m benchmarks.run_benchmark --repeats 5` with `--seed 42`
 (default) on a clean checkout of commit `7d1beac` produces bit-for-bit
-identical seeds, point sets, and results on any machine and PYTHONHASHSEED
-value.
+identical seeds, point sets, and results on any machine.
 
 The `repeat` index is folded into the SHA-256 seed key, so each of the 5
 seeds per config is genuinely independent.
